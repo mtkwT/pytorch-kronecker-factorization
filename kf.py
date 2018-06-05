@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,16 +32,20 @@ class KroneckerFactored(nn.Module):
     BACKWARD = 2
     DONE = 3
 
-    def __init__(self) -> None:
+    def __init__(self,
+                 do_checks: bool = True,
+                 verbose: bool = True,
+                 average_factors: bool = True) -> None:
         super(KroneckerFactored, self).__init__()
         self.__my_handles = []
-        self.__kf_mode = False
-        self.__do_check = True
-        self.__verbose = True
+        self.__kf_mode = False  # One must activate this
+        self.__do_checks = do_checks
+        self.__verbose = verbose
+        self.__average_factors = average_factors
         self.__reset_state()
 
     @property
-    def do_kf(self) -> None:
+    def do_kf(self) -> bool:
         return self.__kf_mode
 
     @do_kf.setter
@@ -55,10 +59,23 @@ class KroneckerFactored(nn.Module):
             self.__set_hooks()
             self.__reset_state()
 
+    @property
+    def output_hessian(self) -> Optional[Tensor]:
+        return self.__output_hessian
+
+    @output_hessian.setter
+    def output_hessian(self, value: Tensor) -> None:
+        if not torch.is_tensor(value) or \
+           value.size() != self.__expected_output_hessian_size:
+            raise ValueError
+        if self.__phase != self.BACKWARD:
+            raise Exception("Bad time to set the output_hessian")
+        self.__output_hessian = value
+
     def __set_hooks(self):
         # Use forward_pre_hooks to check stuff; drop them for speed
         for module in self.modules():
-            if self.__do_check:
+            if self.__do_checks:
                 self.__my_handles.append(
                     module.register_forward_pre_hook(self._kf_pre_hook)
                 )
@@ -75,6 +92,13 @@ class KroneckerFactored(nn.Module):
     def __reset_state(self):
         """This should be called whenever a new hessian is needed"""
         self.__soft_reset_state()
+        self.__preactivations = dict({})
+        self.__inputs_cov = dict({})
+        self.__weights = dict({})
+        self.__biases = dict({})
+        self.__fst_order_transfer = dict({})
+        self.__snd_order_transfer = dict({})
+        self.__output_hessian = None
 
     def __soft_reset_state(self):
         """This should be called before each batch"""
@@ -82,6 +106,7 @@ class KroneckerFactored(nn.Module):
         self.__prev_layer_name = ""
         self.__phase = self.FORWARD
         self.__layer_idx = 0
+        self.__last_linear = -1
 
     def _kf_pre_hook(self, module, _inputs):
         """This hook only checks the architecture"""
@@ -156,19 +181,82 @@ class KroneckerFactored(nn.Module):
 
     def __linear_fwd_hook(self, module, inputs, output):
         assert self.__phase == self.FORWARD
-        pass
 
-    def __relu_fwd_hook(self, module, inputs, output):
+        # Extract inputs
+        assert len(inputs) == 1
+        inputs = inputs[0]
+
+        batch_size = inputs.size(0)
+        inputs = inputs.view(batch_size, -1)
+        inputs_cov = torch.mm(inputs.transpose(0, 1), inputs)
+        inputs_cov.detach()
+        layer_idx = self.__layer_idx
+        if layer_idx not in self.__inputs_cov:
+            if self.__average_factors:
+                self.__inputs_cov[layer_idx] = inputs_cov
+            else:
+                self.__inputs_cov[layer_idx] = [inputs_cov]
+        else:
+            if self.__average_factors:
+                self.__inputs_cov[layer_idx] += inputs_cov
+            else:
+                self.__inputs_cov[layer_idx].append(inputs_cov)
+
+        self.__weights[layer_idx] = module.weight
+        self.__biases[layer_idx] = module.bias
+        self.__last_linear = layer_idx
+        out_no = output.size(1)
+        self.__expected_output_hessian_size = torch.Size([out_no, out_no])
+        print(self.__expected_output_hessian_size)
+
+    def __relu_fwd_hook(self, _module, inputs, _output):
         assert self.__phase == self.FORWARD
-        pass
+        grad = (inputs[0] > 0).type_as(inputs[0]).detach()
+        self.__fst_order_transfer[self.__layer_idx] = grad
+        self.__snd_order_transfer[self.__layer_idx] = None
 
     def __linear_bwd_hook(self, module, grad_input, grad_output):
         assert self.__phase == self.BACKWARD
-        pass
+        print(type(grad_input))
+        print([type(t) for t in grad_input])
+        print([(t.size() if t is not None else t) for t in grad_input])
+        print(len(grad_input))
+
+        layer_idx = self.__layer_idx
+        if layer_idx == self.__last_linear:
+            if self.__output_hessian is None:
+                assert len(grad_output) == 1
+                grad_output = grad_output[0]
+                act = torch.mm(grad_output.transpose(0, 1), grad_output)
+                self.__preactivations[layer_idx] = act.detach()
+            else:
+                self.__preactivations[layer_idx] = self.__output_hessian
+        else:
+            next_pa = self.__preactivations[layer_idx + 2]
+            next_w = self.__weights[layer_idx + 2]
+            act = torch.mm(torch.mm(next_w.transpose(0, 1), next_pa), next_w)
+
+            fst_act = self.__fst_order_transfer[layer_idx + 1].view(-1)
+
+            left_go = fst_act.unsqueeze(1).expand_as(act).detach()
+            right_go = fst_act.unsqueeze(0).expand_as(act).detach()
+            act = left_go * act * right_go
+            snd_act = self.__snd_order_transfer[layer_idx + 1]
+
+            if snd_act is not None:
+                raise ArchitectureNotSupported("ReLU only, dude")
+
+            self.__preactivations[layer_idx] = act.detach()
 
     def __relu_bwd_hook(self, module, grad_input, grad_output):
         assert self.__phase == self.BACKWARD
-        pass
+
+    def get_factors(self) -> Tuple[Tensor, Tensor]:
+        if self.__average_factors:
+            return (self.__inputs_cov / self.__batches_no,
+                    self.__preactivations / self.__batches_no)
+        else:
+            return self.__inputs_cov, self.__preactivations
 
 
 class MLP(KroneckerFactored):
@@ -198,10 +286,14 @@ class MLP(KroneckerFactored):
 
 
 def main():
-    mlp = MLP([10, 10, 10, 10, 10])
-    mlp(torch.randn(1, 10))
+    size = [7, 5, 11, 13, 17, 3]
+    batch_size = 1
+    data = torch.randn(batch_size, size[0], requires_grad=True)
+    target = torch.randn(batch_size, size[-1])
+    mlp = MLP(size)
     mlp.do_kf = True
-    loss = functional.mse_loss(mlp(torch.randn(1, 10)), torch.randn(1, 10))
+    output = mlp(data)
+    loss = functional.mse_loss(output, target)
     loss.backward()
 
 
