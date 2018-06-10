@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ from torch.nn import Module
 # batches of examples are passed through the network.
 
 
-# TODO: Add Fisher factorization for convolutional layers
+# Add Fisher factorization for convolutional layers
 # (https://arxiv.org/pdf/1602.01407.pdf). A KF block approximation
 # like the one for the linear case seems impractical for now.
 
@@ -26,8 +26,11 @@ class ArchitectureNotSupported(Exception):
     pass
 
 
-def is_parametric(module: Module) -> bool:
-    # TODO: support other types of layers (e.g. conv)
+def is_convolutional(module: Module) -> bool:
+    return isinstance(module, nn.Conv2d)
+
+
+def is_linear(module: Module) -> bool:
     return isinstance(module, nn.Linear)
 
 
@@ -48,10 +51,21 @@ class KFHessianProduct(object):
             self._single_product = not isinstance(value, list)
             break
 
-    def __compute_product(self, module_name, weight=None, bias=None):
-        print(type(self.inputs_cov[module_name][0]))
-        print(type(self.preactivations[module_name][0]))
-        params = torch.cat([weight, bias.unsqueeze(1)], 1)
+    def __get_linear_params(self, weight=None, bias=None):
+        return torch.cat([weight, bias.unsqueeze(1)], 1)
+
+    def __get_conv_params(self, weight=None, bias=None):
+        ch_out, ch_in, h_in, w_in = weight.size()
+        return torch.cat([weight.view(ch_out, -1), bias.unsqueeze(1)], dim=1)
+
+    def __compute_product(self, module_name, **kwargs):
+        if module_name.startswith("linear"):
+            params = self.__get_linear_params(**kwargs)
+        elif module_name.startswith("conv"):
+            params = self.__get_conv_params(**kwargs)
+        else:
+            raise NotImplemented
+
         if self._single_product:
             return torch.matmul(torch.matmul(self.preactivations[module_name],
                                              params),
@@ -80,7 +94,9 @@ class KFHessianProduct(object):
 class KroneckerFactored(nn.Module):
 
     ACTIVATION = 1
-    PARAMETRIC = 2
+    LINEAR = 2
+    CONVOLUTIONAL = 3
+    OTHER = 4
 
     FORWARD = 1
     BACKWARD = 2
@@ -88,17 +104,43 @@ class KroneckerFactored(nn.Module):
 
     def __init__(self,
                  do_checks: bool=True,
+                 use_fisher: bool=True,
                  verbose: bool=True,
                  average_factors: bool=True) -> None:
         super(KroneckerFactored, self).__init__()
         self.__my_handles = []
         self.__kf_mode = False  # One must activate this
+        self.__use_fisher = use_fisher
         self.__do_checks = do_checks
         self.__verbose = verbose
         self.__average_factors = average_factors
 
-        self.__preactivations = None
+        self.__reset_state()
+        self.__soft_reset_state()
+
+    def __reset_state(self):
+        """This should be called whenever a new hessian is needed"""
+        self.__soft_reset_state()
+        self.__preactivations = dict({})
+        self.__inputs_cov = dict({})
         self.__output_hessian = None
+        self.__df_dx = dict({})
+        self.__d2f_dx2 = dict({})
+        self.__batches_no = 0
+        self.__module_names = dict({})
+        self.__match_parameters()
+
+    def __soft_reset_state(self):
+        """This should be called before each batch"""
+        self.__prev_layer = None
+        self.__prev_layer_name = "input"
+        self.__phase = self.FORWARD
+        self.__layer_idx = 0
+        self.__last_linear = -1
+        self.__next_parametric = None  # type: Optional[Module]
+        self.__batch_preactivations = dict({})
+        self.__conv_special_inputs = dict({})
+        self.__maybe_exact = True
 
     @property
     def verbose(self) -> bool:
@@ -154,54 +196,39 @@ class KroneckerFactored(nn.Module):
             handle.remove()
         self.__my_handles.clear()
 
-    def __reset_state(self):
-        """This should be called whenever a new hessian is needed"""
-        self.__soft_reset_state()
-        self.__preactivations = dict({})
-        self.__inputs_cov = dict({})
-        self.__output_hessian = None
-        self.__df_dx = dict({})
-        self.__d2f_dx2 = dict({})
-        self.__batches_no = 0
-        self.__module_names = dict({})
-        self.__match_parameters()
-
-    def __soft_reset_state(self):
-        """This should be called before each batch"""
-        self.__prev_layer = None
-        self.__prev_layer_name = ""
-        self.__phase = self.FORWARD
-        self.__layer_idx = 0
-        self.__last_linear = -1
-        self.__next_parametric = None  # type: Optional[Module]
-        self.__batch_preactivations = dict({})
-
     def __match_parameters(self):
         for module_name, module in self.named_modules():
             self.__module_names[id(module)] = module_name
 
     def _kf_pre_hook(self, module, _inputs):
         """This hook only checks the architecture"""
+        use_fisher = self.__use_fisher
         prev_layer = self.__prev_layer
         prev_name = self.__prev_layer_name
         crt_name = module._get_name()
-        msg = f"{prev_name:s} -> {crt_name:s}"
+        msg = f"Need Fisher for {prev_name:s} -> {crt_name:s}."
 
         if self.__verbose:
             print(f"[{self.__layer_idx:d}] {crt_name:s} before FWD")
 
         if isinstance(module, KroneckerFactored):
             self.__soft_reset_state()
-        elif is_parametric(module):
-            if not (prev_layer is None or prev_layer == self.ACTIVATION):
+        elif is_linear(module):
+            if not (use_fisher or prev_layer is None or prev_layer == self.ACTIVATION):
                 raise ArchitectureNotSupported(msg)
-            self.__prev_layer = self.PARAMETRIC
+            self.__prev_layer = self.LINEAR
         elif is_activation(module):
-            if prev_layer != self.PARAMETRIC:
+            if not (use_fisher or prev_layer == self.LINEAR):
                 raise ArchitectureNotSupported(msg)
             self.__prev_layer = self.ACTIVATION
+        elif is_convolutional(module):
+            if not use_fisher:
+                raise ArchitectureNotSupported(msg)
+            self.__prev_layer = self.CONVOLUTIONAL
         else:
-            raise ArchitectureNotSupported(msg)
+            if not use_fisher:
+                raise ArchitectureNotSupported(msg)
+            self.__prev_layer = self.OTHER
         self.__prev_layer_name = crt_name
 
     def _kf_fwd_hook(self, module, inputs, output) -> None:
@@ -212,12 +239,15 @@ class KroneckerFactored(nn.Module):
         if isinstance(module, KroneckerFactored):
             self.__fwd_hook(module, inputs, output)
             return
-        if isinstance(module, nn.Linear):
+        if is_linear(module):
             self.__linear_fwd_hook(module, inputs, output)
         elif is_activation(module):
             self.__activation_fwd_hook(module, inputs, output)
+        elif is_convolutional(module):
+            self.__conv_fwd_hook(module, inputs, output)
         else:
-            raise ArchitectureNotSupported("You shouldn't be here!")
+            if not self.__use_fisher:
+                raise ArchitectureNotSupported("You shouldn't be here!")
         self.__layer_idx += 1
 
     def _kf_bwd_hook(self, module, grad_input, grad_output) -> None:
@@ -228,13 +258,31 @@ class KroneckerFactored(nn.Module):
         if isinstance(module, KroneckerFactored):
             self.__bwd_hook(module, grad_input, grad_output)
             return
-        if isinstance(module, nn.Linear):
+        if is_linear(module):
+            if self.__maybe_exact:
+                self.__maybe_exact = self.__prev_layer is None or \
+                    self.__prev_layer == self.ACTIVATION
             self.__linear_bwd_hook(module, grad_input, grad_output)
             self.__next_parametric = module
+            self.__prev_layer = self.LINEAR
         elif is_activation(module):
-            self.__activation_bwd_hook(module, grad_input, grad_output)
+            self.__maybe_exact = (self.__maybe_exact and self.__prev_layer == self.LINEAR)
+            if self.__maybe_exact:
+                self.__activation_bwd_hook(module, grad_input, grad_output)
+            self.__prev_layer = self.ACTIVATION
+        elif is_convolutional(module):
+            self.__maybe_exact = False
+            self.__conv_bwd_hook(module, grad_input, grad_output)
+            self.__prev_layer = self.CONVOLUTIONAL
         else:
-            raise ArchitectureNotSupported("You shouldn't be here")
+            self.__maybe_exact = False
+            self.__prev_layer = self.OTHER
+
+        if not self.__maybe_exact:
+            self.__d2f_dx2.clear()
+            self.__df_dx.clear()
+            self.__batch_preactivations.clear()
+
         self.__layer_idx -= 1
         if self.__layer_idx < 0:
             self.__phase = self.DONE
@@ -246,6 +294,8 @@ class KroneckerFactored(nn.Module):
     def __fwd_hook(self, _module, _inputs, _output):
         self.__phase = self.BACKWARD
         self.__layer_idx -= 1
+        self.__maybe_exact = True
+        self.__prev_layer = None
 
     def __bwd_hook(self, _module, grad_inputs, _grad_output):
         # DO NOT USE THIS! Seems to be a bug in pytorch, this hook is
@@ -281,11 +331,123 @@ class KroneckerFactored(nn.Module):
         batch_size, out_no = output.size()
         self.__expected_output_hessian_size = torch.Size([batch_size, out_no, out_no])
 
+    def __conv_fwd_hook(self, module, inputs, output):
+        module_name = self.__module_names[id(module)]
+        assert isinstance(inputs, tuple) and len(inputs) == 1
+        assert isinstance(output, Tensor)
+        inputs, = inputs
+
+        ch_out, ch_in, k_h, k_w = module.weight.size()
+        s_h, s_w = module.stride
+        b_sz, ch_in_, h_in, w_in = inputs.size()
+        h_out = (h_in - k_h + 0) // s_h + 1
+        w_out = (w_in - k_w + 0) // s_w + 1
+        b_sz_, ch_out_, h_out_, w_out_ = output.size()
+
+        print(h_out, w_out)
+
+        assert ch_in_ == ch_in
+        assert h_out_ == h_out
+        assert w_out == w_out_ and \
+            ch_out_ == ch_out and b_sz_ == b_sz
+        print(ch_out, ch_in, k_h, k_w)
+
+        x = inputs.new().resize_(b_sz, h_out, w_out, ch_in, k_h, k_w)
+
+        for idx_h in range(0, h_out):
+            start_h = idx_h * s_h
+            for idx_w in range(0, w_out):
+                start_w = idx_w * s_w
+                x[:, idx_h, idx_w, :, :, :].copy_(inputs[:, :, start_h:(start_h + k_h), start_w:(start_w + k_w)])
+
+        x = x.view(b_sz * h_out * w_out, ch_in * k_h * k_w)
+        if self.__do_checks:
+            self.__conv_special_inputs[module_name] = x
+
+        x = torch.cat([x, x.new().resize_(x.size(0), 1).fill_(1)], dim=1)
+
+        if self.__do_checks:
+            weight_extra = torch.cat([module.weight
+                                      #.view(ch_out, ch_in, -1)
+                                      #.transpose(1, 2).contiguous()
+                                      .view(ch_out, -1),
+                                      module.bias.view(ch_out, -1)], dim=1)
+            y = torch.matmul(x, weight_extra.t()).view(b_sz, h_out * w_out, ch_out)\
+                .transpose(1, 2)\
+                .view(b_sz, ch_out, h_out, w_out)
+            print((y - output).abs().sum())
+            assert (y - output).abs().max() < 1e-5
+            print("----------------")
+            # assert torch.allclose(y, output)
+
+        inputs_cov = torch.mm(x.t(), x) / b_sz
+        if module_name not in self.__inputs_cov:
+            if self.__average_factors:
+                self.__inputs_cov[module_name] = inputs_cov
+            else:
+                self.__inputs_cov[module_name] = [inputs_cov]
+        else:
+            if self.__average_factors:
+                self.__inputs_cov[module_name] += inputs_cov
+            else:
+                self.__inputs_cov[module_name].append(inputs_cov)
+
+    def __conv_bwd_hook(self, module, grad_input, grad_output):
+        print([t.size() for t in grad_input])
+        assert isinstance(grad_input, tuple) and len(grad_input) == 3
+        assert isinstance(grad_output, tuple) and len(grad_output) == 1
+        module_name = self.__module_names[id(module)]
+        dx, dw, db = grad_input
+        dy, = grad_output
+        b_sz, ch_out, h_out, w_out = dy.size()
+        dy = dy.view(b_sz, ch_out, -1).transpose(1, 2).contiguous().view(-1, ch_out)
+        if self.__do_checks:
+            ch_out_, ch_in, k_h, k_w = module.weight.size()
+            assert ch_out == ch_out_
+            x = self.__conv_special_inputs[module_name]
+            b_sz = dx.size(0)
+            ch_out = dy.size(1)
+
+            dw_ = torch.mm(dy.t(), x)
+            print(dw_.view(ch_out, k_h, k_w, -1))
+            print(dw)
+
+        act = torch.mm(dy.t(), dy) / (b_sz * h_out * w_out)
+
+        if self.__average_factors:
+            if module_name in self.__preactivations:
+                self.__preactivations[module_name] += act
+            else:
+                self.__preactivations[module_name] = act
+        else:
+            self.__preactivations.setdefault(module_name, []).append(act)
+
     def __linear_bwd_hook(self, module, grad_input, grad_output):
         assert self.__phase == self.BACKWARD
+        if self.__maybe_exact:
+            self.__linear_exact_hessian(module, grad_input, grad_output)
+        else:
+            self.__linear_fisher(module, grad_input, grad_output)
 
+        if self.__layer_idx == 0:
+            self.__batches_no += 1
+
+    def __linear_fisher(self, module, grad_input, grad_output):
+        module_name = self.__module_names[id(module)]
+        assert isinstance(grad_output, tuple) and len(grad_output) == 1
+        grad_output, = grad_output
+        act = torch.matmul(grad_output.t(), grad_output)
+        act /= float(grad_output.size(0))
+        if self.__average_factors:
+            if module_name in self.__preactivations:
+                self.__preactivations[module_name] += act
+            else:
+                self.__preactivations[module_name] = act
+        else:
+            self.__preactivations.setdefault(module_name, []).append(act)
+
+    def __linear_exact_hessian(self, module, grad_input, grad_output):
         layer_idx = self.__layer_idx
-
         if layer_idx == self.__last_linear:
             if self.__output_hessian is None:
                 assert self.__next_parametric is None
@@ -331,9 +493,6 @@ class KroneckerFactored(nn.Module):
         else:
             self.__preactivations.setdefault(module_name, []).append(act.mean(0))
 
-        if self.__layer_idx == 0:
-            self.__batches_no += 1
-
     def __activation_fwd_hook(self, _module, inputs, output):
         layer_idx = self.__layer_idx
         inputs, = inputs
@@ -366,6 +525,56 @@ class KroneckerFactored(nn.Module):
         return kfhp
 
 
+class LeNet(KroneckerFactored):
+
+    def __init__(self,
+                 filters_no: List[int],
+                 filter_size: List[Union[int, Tuple[int, int]]],
+                 stride: List[Union[int, Tuple[int, int]]],
+                 units_no: List[int],
+                 **kwargs) -> None:
+        super(LeNet, self).__init__(**kwargs)
+
+        if len(filters_no) != len(filter_size) + 1 or\
+           len(filters_no) != len(stride) + 1:
+            raise ValueError
+
+        self.conv_modules: List[Module] = []
+        self.fc_modules: List[Module] = []
+
+        self.conv_depth = conv_depth = len(filters_no) - 1
+        self.fc_depth = fc_depth = len(units_no) - 1
+        self.depth = self.conv_depth + self.fc_depth
+
+        for idx in range(1, conv_depth + 1):
+            conv_layer = nn.Conv2d(*filters_no[idx-1:idx+1],
+                                   kernel_size=filter_size[idx-1],
+                                   stride=stride[idx-1])
+            setattr(self, f"conv_{idx:d}", conv_layer)
+            relu_layer = nn.ReLU()
+            setattr(self, f"relu_{idx:d}", relu_layer)
+            self.conv_modules.extend([conv_layer, relu_layer])
+
+        for idx in range(1, fc_depth):
+            linear_layer = nn.Linear(*units_no[idx-1:idx+1])
+            setattr(self, f"linear_{idx+conv_depth:d}", linear_layer)
+            relu_layer = nn.ReLU()
+            setattr(self, f"relu_{idx+conv_depth:d}", relu_layer)
+            self.fc_modules.extend([linear_layer, relu_layer])
+
+        output_layer = nn.Linear(*units_no[-2:])
+        setattr(self, f"linear_{conv_depth+fc_depth:d}", output_layer)
+        self.fc_modules.append(output_layer)
+
+    def forward(self, x: Tensor) -> Tensor:
+        for module in self.conv_modules:
+            x = module(x)
+        x = x.view(x.size(0), -1)
+        for module in self.fc_modules:
+            x = module(x)
+        return x
+
+
 class MLP(KroneckerFactored):
 
     def __init__(self, units_no: List[int], **kwargs) -> None:
@@ -392,7 +601,7 @@ class MLP(KroneckerFactored):
         return x
 
 
-def main():
+def test_mlp():
     size = [7, 5, 11, 13, 17, 3]
     batch_size = 10
     mlp = MLP(size, average_factors=False)
@@ -410,6 +619,51 @@ def main():
         dummy_vector[name] = torch.randn(param.size())
 
     print(kfhp.hessian_product_loss(dummy_vector))
+
+
+def test_simple():
+    s_net = LeNet([1, 2], [(3, 3)], [(1, 1)], [18, 1])
+    s_net.zero_grad()
+    s_net.do_kf = True
+    data = torch.randn(1, 1, 5, 5, requires_grad=True)
+    output = s_net(data)
+    output.backward()
+
+
+def test_lenet():
+    filters_no = [3, 2, 3, 2]
+    filter_size = [(4, 7), (3, 5), (5, 3)]
+    stride = [(1, 1), (2, 3), (1, 1)]
+    size = [7, 5, 11, 13, 17, 3]
+    in_size = (21, 23)
+    h, w = in_size
+    for ((k_h, k_w), (s_h, s_w)) in zip(filter_size, stride):
+        h, w = (h - k_h + 0) // s_h + 1, (w - k_w + 0) // s_w + 1
+        print(h, w)
+    size = [h * w * filters_no[-1]] + size
+    batch_size = 10
+    mlp = LeNet(filters_no, filter_size, stride, size, average_factors=False)
+
+    mlp.do_kf = True
+
+    for _idx in range(10):
+        data = torch.randn(batch_size, filters_no[0], *in_size, requires_grad=True)
+        target = torch.randn(batch_size, size[-1])
+        output = mlp(data)
+        loss = functional.mse_loss(output, target)
+        loss.backward()
+    kfhp = mlp.end_kf()
+    dummy_vector = dict({})
+    for name, param in mlp.named_parameters():
+        dummy_vector[name] = torch.randn(param.size())
+
+    print(kfhp.hessian_product_loss(dummy_vector))
+
+
+def main():
+    test_mlp()
+    test_simple()
+    test_lenet()
 
 
 if __name__ == "__main__":
